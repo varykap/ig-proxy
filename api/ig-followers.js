@@ -1,7 +1,6 @@
 // api/ig-followers.js
-// Extrae Followers reales de páginas públicas (vía espejos de texto)
-// Soporta: "34 Followers", "Followers 34", "34 Seguidores", "Seguidores 34"
-// y NO confunde con Following/Seguidos ni Posts/Publicaciones.
+// Parser posicional robusto: empareja etiquetas (followers/following/posts)
+// con el número más cercano (mismo renglón, antes/después, o renglón siguiente).
 
 module.exports = async function (req, res) {
   try {
@@ -18,12 +17,12 @@ module.exports = async function (req, res) {
     for (const url of sources) {
       const text = await fetchText(url);
       if (!text) continue;
-      const parsed = extractMetrics(text);
-      if (parsed && parsed.followers > 0) {
-        return res.json({ followers: parsed.followers, source: url });
+
+      const metrics = extractByProximity(text);
+      if (metrics && metrics.followers) {
+        return res.json({ followers: metrics.followers, source: url });
       }
     }
-
     return res.status(404).json({ error: "followers no encontrado en fuentes" });
   } catch (err) {
     return res.status(500).json({ error: "error interno", detail: String(err) });
@@ -35,7 +34,8 @@ async function fetchText(url) {
     const r = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Serverless Fetch)",
-        "Accept": "text/plain, text/html;q=0.9,*/*;q=0.8"
+        "Accept": "text/plain, text/html;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache"
       }
     });
     if (!r.ok) return null;
@@ -45,7 +45,7 @@ async function fetchText(url) {
   }
 }
 
-// Normaliza "1,234", "3.5K", "2.1M" -> entero
+// --- Utilidades de números ---
 function normalizeNumber(s) {
   if (!s) return null;
   let t = String(s).trim().replace(/,/g, "").replace(/\s+/g, "");
@@ -62,112 +62,40 @@ function normalizeNumber(s) {
   return Math.round(v * mul);
 }
 
-// Extrae métricas con mapeo de etiquetas (ES/EN) y proximidad
-function extractMetrics(text) {
-  const L = text;                 // texto original
-  const low = L.toLowerCase();    // para búsquedas
-  // Etiquetas por tipo:
-  const labs = {
-    followers: ["followers","seguidores"],
-    following: ["following","siguiendo","seguidos"],
-    posts:     ["posts","publicaciones"]
-  };
-
-  // 1) Intento estructurado: por líneas (más fácil anclar número correcto)
-  let followers = findLabeledNumberByLines(L, labs.followers);
-  let following = findLabeledNumberByLines(L, labs.following);
-  let posts     = findLabeledNumberByLines(L, labs.posts);
-
-  // 2) Si followers aún no está, intenta con patrones globales
-  if (!followers) followers = findLabeledNumberAnywhere(L, labs.followers);
-
-  // 3) Sanidad básica: si followers coincide con posts y posts >> 1000, descarta y busca otra vez
-  if (followers && posts && followers === posts && posts > 1000) {
-    // Reintento más estricto alrededor de la etiqueta
-    followers = findClosestToLabel(L, labs.followers);
-  }
-
-  return (followers || following || posts) ? { followers, following, posts } : null;
-}
-
-// Busca en líneas: etiqueta y número en la misma línea (antes o después), el más cercano
-function findLabeledNumberByLines(text, labelList) {
-  const lines = text.split(/\r?\n/);
-  let best = null;
-
-  for (const line of lines) {
-    const lineLow = line.toLowerCase();
-    const hasLabel = labelList.some(lb => lineLow.includes(lb));
-    if (!hasLabel) continue;
-
-    // Busca números en la línea
-    const numRe = /(\d[\d.,]*\s*[KkMmBb]?)/g;
-    const nums = [];
-    let m;
-    while ((m = numRe.exec(line)) !== null) {
-      nums.push({ val: m[1], idx: m.index });
-    }
-    if (nums.length === 0) continue;
-
-    // Posición de la etiqueta (primera coincidencia)
-    let labIdx = -1;
-    for (const lb of labelList) {
-      const i = lineLow.indexOf(lb);
-      if (i >= 0) { labIdx = i; break; }
-    }
-    if (labIdx < 0) continue;
-
-    // Elige el número más cercano a la etiqueta
-    nums.sort((a, b) => Math.abs(a.idx - labIdx) - Math.abs(b.idx - labIdx));
-    for (const candidate of nums) {
-      const n = normalizeNumber(candidate.val);
-      if (n) { best = n; break; }
-    }
-    if (best) break;
-  }
-  return best;
-}
-
-// Busca “etiqueta + número” o “número + etiqueta” en todo el texto
-function findLabeledNumberAnywhere(text, labelList) {
-  const labelAlt = labelList.join("|");
-  const reNumLabel = new RegExp(`(\\d[\\d.,]*\\s*[KkMmBb]?)\\s*(?:${labelAlt})\\b`, "gi");
-  const reLabelNum = new RegExp(`\\b(?:${labelAlt})\\b\\s*:?\\s*(\\d[\\d.,]*\\s*[KkMmBb]?)`, "gi");
+// Tokeniza: números y etiquetas con su posición en el texto
+function tokenize(text) {
+  const tokens = [];
+  const numRe = /(\d[\d.,]*\s*[KkMmBb]?)/g;
+  const labRe = /\b(Followers|followers|Seguidores|SEGUIDORES|Following|following|Siguiendo|seguidos|SIGUIENDO|Posts|posts|Publicaciones)\b/g;
 
   let m;
-  while ((m = reNumLabel.exec(text)) !== null) {
-    const n = normalizeNumber(m[1]); if (n) return n;
+  while ((m = numRe.exec(text)) !== null) {
+    tokens.push({ type: "num", raw: m[1], idx: m.index });
   }
-  while ((m = reLabelNum.exec(text)) !== null) {
-    const n = normalizeNumber(m[1]); if (n) return n;
+  while ((m = labRe.exec(text)) !== null) {
+    const lab = m[1].toLowerCase();
+    let kind = null;
+    if (/followers|seguidores/.test(lab)) kind = "followers";
+    else if (/following|siguiendo|seguidos/.test(lab)) kind = "following";
+    else if (/posts|publicaciones/.test(lab)) kind = "posts";
+    if (kind) tokens.push({ type: "label", kind, raw: m[1], idx: m.index });
   }
-  return null;
+  // ordenar por posición
+  tokens.sort((a, b) => a.idx - b.idx);
+  return tokens;
 }
 
-// Como último recurso, toma el número más cercano a la etiqueta (ventana local)
-function findClosestToLabel(text, labelList) {
-  const low = text.toLowerCase();
-  let pos = -1;
-  for (const lb of labelList) {
-    pos = low.indexOf(lb);
-    if (pos >= 0) break;
-  }
-  if (pos < 0) return null;
-
-  const start = Math.max(0, pos - 200);
-  const end   = Math.min(text.length, pos + 200);
-  const win   = text.slice(start, end);
-
-  // intenta antes de la etiqueta
-  let m = win.match(/(\d[\d.,]*\s*[KkMmBb]?)\s*(?:<\/?\w+[^>]*>|\s){0,8}$/i);
-  if (m && m[1]) { const n = normalizeNumber(m[1]); if (n) return n; }
-  // intenta después de la etiqueta
-  m = win.match(/^(?:<\/?\w+[^>]*>|\s){0,8}(\d[\d.,]*\s*[KkMmBb]?)/i);
-  if (m && m[1]) { const n = normalizeNumber(m[1]); if (n) return n; }
-
-  // cualquier número en ventana
-  m = win.match(/(\d[\d.,]*\s*[KkMmBb]?)/);
-  if (m && m[1]) { const n = normalizeNumber(m[1]); if (n) return n; }
-
-  return null;
-}
+// Busca la pareja numérica MÁS CERCANA a cada etiqueta (antes o después),
+// con límites de distancia y evitando cruzarse con otra etiqueta.
+function pairClosest(text, labelTokens, numTokens, maxDist = 80) {
+  const pairs = []; // { kind, value }
+  for (const lab of labelTokens) {
+    let best = null;
+    // buscar a la izquierda
+    for (let i = numTokens.length - 1; i >= 0; i--) {
+      const tok = numTokens[i];
+      if (tok.idx >= lab.idx) break;
+      const dist = lab.idx - tok.idx;
+      if (dist > maxDist) continue;
+      // Si entre el número y la etiqueta hay otra etiqueta, lo descartamos
+      const between = text.slice(
