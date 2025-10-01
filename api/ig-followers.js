@@ -1,36 +1,24 @@
-// api/ig-followers.js  (Node 18+ / Vercel Serverless)
-// Devuelve { followers: <n> } tomando la cifra de una página pública
-// a través de un espejo de texto (sin JS). Ejemplo: ?username=gridphotogallery
-
-export default async function handler(req, res) {
+// api/ig-followers.js
+module.exports = async function (req, res) {
   try {
     const username = (req.query.username || "").trim().toLowerCase();
-    if (!username) {
-      return res.status(400).json({ error: "username requerido" });
-    }
+    if (!username) return res.status(400).json({ error: "username requerido" });
 
-    // Espejo de texto (usa la URL HTTPS del destino dentro del path):
     const mirrorUrl = `https://r.jina.ai/https://instastatistics.com/${encodeURIComponent(username)}`;
-
     const r = await fetch(mirrorUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Serverless Fetch)",
         "Accept": "text/plain, text/html;q=0.9,*/*;q=0.8",
       },
     });
-
-    if (!r.ok) {
-      return res.status(502).json({ error: "fuente no disponible", status: r.status });
-    }
+    if (!r.ok) return res.status(502).json({ error: "fuente no disponible", status: r.status });
 
     const text = await r.text();
 
-    // Caso principal: número inmediatamente antes de 'Followers'/'Seguidores'
     const re = /(\d[\d.,]*\s*[KkMmBb]?)\s*(Followers|followers|Seguidores|SEGUIDORES)/;
     const m = text.match(re);
 
     if (!m) {
-      // Fallback por líneas: última "palabra numérica" antes de la clave en la misma línea
       let followers = null;
       for (const line of text.split(/\r?\n/)) {
         if (/Followers|followers|Seguidores|SEGUIDORES/.test(line)) {
@@ -45,11 +33,10 @@ export default async function handler(req, res) {
 
     const rawNum = m[1];
     return res.json({ followers: normalizeNumber(rawNum), source: "instastatistics (mirror)" });
-
   } catch (err) {
     return res.status(500).json({ error: "error interno", detail: String(err) });
   }
-}
+};
 
 function normalizeNumber(s) {
   let t = (s || "").trim().replace(/,/g, "").replace(/\s+/g, "");
