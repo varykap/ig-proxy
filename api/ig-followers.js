@@ -16,10 +16,10 @@ module.exports = async function (req, res) {
       const text = await fetchText(url);
       if (!text) continue;
 
-      const followers = extractFollowersStrict3(text);
-      if (followers) {
-        const out = { followers, source: url };
-        if (debug) out.debug_sample = sampleAround(text, /(Followers|Seguidores)/i, 240);
+      const { value, context } = extractFollowersFlexible(text);
+      if (value) {
+        const out = { followers: value, source: url };
+        if (debug) out.debug_context = context;
         return res.json(out);
       }
     }
@@ -62,60 +62,86 @@ function toNumber(s) {
   return Math.round(v * mul);
 }
 
-// ===== extractor: misma línea, línea anterior y línea siguiente =====
-function extractFollowersStrict3(text) {
-  const lines = text.split(/\r?\n/);
+function extractFollowersFlexible(text) {
+  // Preproceso suave: quita espacios extra a cada línea, pero conserva el orden
+  const rawLines = text.split(/\r?\n/);
+  const lines = rawLines.map(l => l.replace(/\s+$/,''));
+  const n = lines.length;
 
-  // 1) MISMA LÍNEA: "Followers 34" o "Followers: 34"
-  for (const line of lines) {
-    const idx = line.search(/\b(Followers|Seguidores)\b/i);
-    if (idx < 0) continue;
+  const labelRe = /\b(Followers|Seguidores)\b/i;
+  const badLabelRe = /\b(Following|Siguiendo|Seguidos|Posts|Publicaciones)\b/i;
+  const numRe = /(\d[\d.,]*\s*[KkMmBb]?)/;
 
-    // Bloque desde la etiqueta, pero cortamos si aparece Following/Siguiendo/Seguidos
-    const tail = line.slice(idx).split(/(Following|Siguiendo|Seguidos)/i)[0];
-    const m = tail.match(/\b(Followers|Seguidores)\b\s*:?[\s<]*(\d[\d.,]*\s*[KkMmBb]?)/i);
-    if (m && m[2]) {
-      const n = toNumber(m[2]);
-      if (n) return n;
+  // Escanea todas las líneas donde aparece "Followers/Seguidores"
+  for (let i = 0; i < n; i++) {
+    if (!labelRe.test(lines[i])) continue;
+
+    // Construye una ventana de contexto ±3 líneas
+    const from = Math.max(0, i - 3);
+    const to   = Math.min(n - 1, i + 3);
+
+    // 1) MISMA LÍNEA, número después de la etiqueta (más común)
+    {
+      const tail = lines[i].slice(lines[i].search(labelRe));
+      const block = tail.split(badLabelRe)[0];
+      const m = block.match(/\b(Followers|Seguidores)\b\s*:?[\s<]*(\d[\d.,]*\s*[KkMmBb]?)/i);
+      if (m && m[2]) {
+        const v = toNumber(m[2]);
+        if (v) return { value: v, context: contextSlice(lines, i) };
+      }
+    }
+
+    // 2) LÍNEA ANTERIOR: último token numérico (evitando líneas con etiquetas "malas")
+    for (let k = 1; k <= 3; k++) {
+      const j = i - k;
+      if (j < 0) break;
+      if (badLabelRe.test(lines[j])) continue;
+      const m = lines[j].match(numRe);
+      if (m) {
+        const v = toNumber(m[1]);
+        if (v) return { value: v, context: contextSlice(lines, i) };
+      }
+    }
+
+    // 3) LÍNEA SIGUIENTE: primer token numérico (evitando etiquetas malas)
+    for (let k = 1; k <= 3; k++) {
+      const j = i + k;
+      if (j >= n) break;
+      if (badLabelRe.test(lines[j])) continue;
+      const m = lines[j].match(numRe);
+      if (m) {
+        const v = toNumber(m[1]);
+        if (v) return { value: v, context: contextSlice(lines, i) };
+      }
+    }
+
+    // 4) Último recurso en ventana: busca el número más cercano mirando hacia atrás y adelante
+    // siempre evitando que entre la etiqueta y el número aparezca una etiqueta "mala".
+    // Hacia atrás
+    for (let j = i - 1; j >= from; j--) {
+      if (badLabelRe.test(lines[j])) break;
+      const m = lines[j].match(numRe);
+      if (m) {
+        const v = toNumber(m[1]);
+        if (v) return { value: v, context: contextSlice(lines, i) };
+      }
+    }
+    // Hacia delante
+    for (let j = i + 1; j <= to; j++) {
+      if (badLabelRe.test(lines[j])) break;
+      const m = lines[j].match(numRe);
+      if (m) {
+        const v = toNumber(m[1]);
+        if (v) return { value: v, context: contextSlice(lines, i) };
+      }
     }
   }
 
-  // 2) LÍNEA ANTERIOR: número en la línea anterior a la etiqueta (tu caso)
-  for (let i = 1; i < lines.length; i++) {
-    if (!/\b(Followers|Seguidores)\b/i.test(lines[i])) continue;
-    // Evitar confusión si en la línea de etiqueta hay "Following/Siguiendo/Seguidos"
-    if (/\b(Following|Siguiendo|Seguidos)\b/i.test(lines[i])) continue;
-
-    // última "palabra numérica" de la línea anterior
-    const prev = lines[i - 1];
-    const mPrev = prev && prev.match(/(\d[\d.,]*\s*[KkMmBb]?)\s*$/);
-    if (mPrev && mPrev[1]) {
-      const n = toNumber(mPrev[1]);
-      if (n) return n;
-    }
-  }
-
-  // 3) LÍNEA SIGUIENTE: número al inicio de la línea siguiente
-  for (let i = 0; i < lines.length - 1; i++) {
-    if (!/\b(Followers|Seguidores)\b/i.test(lines[i])) continue;
-    if (/\b(Following|Siguiendo|Seguidos)\b/i.test(lines[i])) continue;
-
-    const mNext = lines[i + 1].match(/^\s*(\d[\d.,]*\s*[KkMmBb]?)/);
-    if (mNext && mNext[1]) {
-      const n = toNumber(mNext[1]);
-      if (n) return n;
-    }
-  }
-
-  return null;
+  return { value: null, context: null };
 }
 
-function sampleAround(text, pattern, radius) {
-  const low = text.toLowerCase();
-  const m = low.match(new RegExp(pattern, "i"));
-  if (!m) return text.slice(0, Math.min(400, text.length));
-  const idx = low.indexOf(m[0].toLowerCase());
-  const s = Math.max(0, idx - radius);
-  const e = Math.min(text.length, idx + radius);
-  return text.slice(s, e);
+function contextSlice(lines, centerIdx, radius = 5) {
+  const s = Math.max(0, centerIdx - radius);
+  const e = Math.min(lines.length - 1, centerIdx + radius);
+  return lines.slice(s, e + 1).join("\n");
 }
